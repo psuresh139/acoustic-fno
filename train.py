@@ -142,8 +142,8 @@ def train(
         if val_loss < best_val:
             best_val = val_loss
             torch.save({"model_state": model.state_dict(),
-                        "config": {"d_model": d_model, "n_layers": n_layers,
-                                   "k_max": k_max}},
+                        "config": {"C_in": 3, "d_model": d_model,
+                                   "n_layers": n_layers, "k_max": k_max}},
                        out_path)
 
         if epoch % 10 == 0 or epoch == 1:

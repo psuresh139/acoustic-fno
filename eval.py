@@ -37,7 +37,7 @@ from model import FNO2D
 def load_model(ckpt_path: str, device: str) -> FNO2D:
     ckpt   = torch.load(ckpt_path, map_location=device, weights_only=True)
     cfg    = ckpt["config"]
-    model  = FNO2D(C_in=2, C_out=1, d_model=cfg["d_model"],
+    model  = FNO2D(C_in=cfg.get("C_in", 3), C_out=1, d_model=cfg["d_model"],
                    n_layers=cfg["n_layers"],
                    k_max_h=cfg["k_max"], k_max_w=cfg["k_max"])
     model.load_state_dict(ckpt["model_state"])
