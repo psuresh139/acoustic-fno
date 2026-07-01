@@ -155,7 +155,7 @@ class FNO2D(nn.Module):
 
     def __init__(
         self,
-        C_in: int    = 2,
+        C_in: int    = 3,
         C_out: int   = 1,
         d_model: int = 32,
         n_layers: int = 4,

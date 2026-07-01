@@ -11,15 +11,31 @@ leap-frog FDTD update):
 
 where λ = c·dt/dx  (Courant number; stable iff λ ≤ 1/√2 in 2D).
 
-Geometry is encoded as a binary mask (1 = free space, 0 = wall/obstacle).
-Dirichlet BC p=0 at walls is enforced by zeroing masked cells each step.
-Interior rectangular obstacles use the same mechanism, so the transition
-from a clean rectangular room to a room-with-obstacles costs exactly one
-extra multiply.
+Boundary conditions
+───────────────────
+Outer walls support a Robin (impedance) BC:  ∂p/∂n + α·p = 0
+
+Discretising the normal derivative with a one-sided difference gives:
+
+  p_wall = p_neighbour / (1 + α·dx)
+
+Special cases:
+  α = 0          →  p_wall = p_neighbour   (Neumann, ∂p/∂n = 0, perfectly reflective)
+  α → ∞          →  p_wall → 0             (Dirichlet, pressure-release, fully absorptive)
+
+α is the wall impedance parameter (units 1/length with dx=1).
+Physically meaningful range: α ∈ [0, 4].
+  α·dx = 0   → reflection coefficient R = 1   (hard wall)
+  α·dx = 1   → R = 0.5
+  α·dx = 4   → R = 0.2
+  α·dx → ∞  → R → 0   (anechoic)
+
+Interior rectangular obstacles always use Dirichlet (rigid scatterers).
 
 Dataset layout (each sample):
-  inputs  shape (2, H, W) — channel 0: geometry mask
+  inputs  shape (3, H, W) — channel 0: geometry mask (1=free, 0=wall/obstacle)
                           — channel 1: source map (Gaussian at source position)
+                          — channel 2: alpha map (α value at outer wall cells, 0 elsewhere)
   target  shape (1, H, W) — pressure field at step T_STEPS
 """
 
@@ -89,21 +105,43 @@ def make_source_map(
     return source_map.astype(np.float32), (int(sr), int(sc))
 
 
+def make_alpha_map(
+    H: int,
+    W: int,
+    alpha: float,
+    max_alpha: float = 4.0,
+) -> np.ndarray:
+    """
+    A map with the normalised α value on outer wall cells, 0 elsewhere.
+    Normalised to [0, 1] so the FNO sees a consistent input scale.
+    Interior obstacles are not encoded here — they're already in the mask.
+    """
+    alpha_map = np.zeros((H, W), dtype=np.float32)
+    alpha_norm = alpha / max_alpha
+    alpha_map[0, :]  = alpha_norm   # top wall
+    alpha_map[-1, :] = alpha_norm   # bottom wall
+    alpha_map[:, 0]  = alpha_norm   # left wall
+    alpha_map[:, -1] = alpha_norm   # right wall
+    return alpha_map
+
+
 def fdtd_2d(
     mask: np.ndarray,
     source_map: np.ndarray,
     n_steps: int,
     dx: float = 1.0,
     c: float = 1.0,
+    alpha: float = 0.0,
 ) -> np.ndarray:
     """
     Run FDTD for n_steps and return the pressure field at the final step.
 
-    Initial condition: p^0 = source_map, p^{-1} = 0  (sharp pulse).
-    Courant number λ = c·dt/dx is set to 0.4 (well below 1/√2 ≈ 0.707).
+    alpha : Robin BC parameter on outer walls (0 = Neumann/reflective,
+            large = Dirichlet/absorptive). Interior obstacles always Dirichlet.
     """
-    dt = 0.4 * dx / c
-    lam2 = (c * dt / dx) ** 2   # λ²
+    dt   = 0.4 * dx / c
+    lam2 = (c * dt / dx) ** 2
+    denom = 1.0 + alpha * dx       # Robin BC denominator: p_wall = p_nbr / denom
 
     p_prev = np.zeros_like(mask)
     p_curr = source_map.copy()
@@ -116,7 +154,16 @@ def fdtd_2d(
         )
         p_next = np.zeros_like(p_curr)
         p_next[1:-1, 1:-1] = 2.0 * p_curr[1:-1, 1:-1] - p_prev[1:-1, 1:-1] + lam2 * lap
-        p_next *= mask            # enforce Dirichlet BC on walls + obstacles
+
+        # Dirichlet on interior obstacles (mask zeros them out)
+        p_next *= mask
+
+        # Robin BC on the four outer walls (overwrite the zeros left by mask)
+        p_next[0, :]  = p_next[1, :]  / denom
+        p_next[-1, :] = p_next[-2, :] / denom
+        p_next[:, 0]  = p_next[:, 1]  / denom
+        p_next[:, -1] = p_next[:, -2] / denom
+
         p_prev, p_curr = p_curr, p_next
 
     return p_curr.astype(np.float32)
@@ -129,30 +176,36 @@ def generate_dataset(
     H: int = 64,
     W: int = 64,
     n_steps: int = 200,
-    max_obstacles: int = 0,   # 0 = fixed-geometry (Phase 1)
+    max_obstacles: int = 0,
+    max_alpha: float = 0.0,    # 0 = Dirichlet-only (Stages 1&2), >0 = Robin BC (Stage 3)
     seed: int = 42,
     out_path: str = "data/dataset.pt",
 ) -> None:
     """
     Generate n_samples (input, target) pairs and save as a .pt file.
 
-    With max_obstacles=0 every sample is the same rectangular room; only the
-    source position varies.  Set max_obstacles>0 for variable-geometry mode.
+    max_alpha > 0 enables Stage 3: each sample draws α ~ Uniform(0, max_alpha),
+    encoding the wall absorption from perfectly reflective (α=0) to strongly
+    absorptive (α=max_alpha).  Recommended max_alpha=4.0.
     """
     rng = np.random.default_rng(seed)
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
 
-    inputs  = torch.zeros(n_samples, 2, H, W)   # [mask, source]
-    targets = torch.zeros(n_samples, 1, H, W)   # [pressure at T]
+    inputs  = torch.zeros(n_samples, 3, H, W)   # [mask, source, alpha_map]
+    targets = torch.zeros(n_samples, 1, H, W)
 
     for i in range(n_samples):
-        n_obs = int(rng.integers(0, max_obstacles + 1)) if max_obstacles > 0 else 0
+        n_obs  = int(rng.integers(0, max_obstacles + 1)) if max_obstacles > 0 else 0
+        alpha  = float(rng.uniform(0, max_alpha)) if max_alpha > 0 else 0.0
+
         mask       = make_geometry(H, W, n_obstacles=n_obs, rng=rng)
         source_map, _ = make_source_map(H, W, mask, rng=rng)
-        pressure   = fdtd_2d(mask, source_map, n_steps=n_steps)
+        alpha_map  = make_alpha_map(H, W, alpha, max_alpha=max(max_alpha, 1e-6))
+        pressure   = fdtd_2d(mask, source_map, n_steps=n_steps, alpha=alpha)
 
         inputs[i, 0]  = torch.from_numpy(mask)
         inputs[i, 1]  = torch.from_numpy(source_map)
+        inputs[i, 2]  = torch.from_numpy(alpha_map)
         targets[i, 0] = torch.from_numpy(pressure)
 
         if (i + 1) % max(1, n_samples // 10) == 0:
@@ -170,19 +223,21 @@ if __name__ == "__main__":
     parser.add_argument("--H",             type=int, default=64)
     parser.add_argument("--W",             type=int, default=64)
     parser.add_argument("--n_steps",       type=int, default=200)
-    parser.add_argument("--max_obstacles", type=int, default=0,
-                        help="0=fixed room, >0=variable geometry")
-    parser.add_argument("--seed",          type=int, default=42)
-    parser.add_argument("--out",           type=str, default="data/dataset.pt")
+    parser.add_argument("--max_obstacles", type=int,   default=0)
+    parser.add_argument("--max_alpha",     type=float, default=0.0,
+                        help="Max wall absorption (0=Dirichlet only, 4.0=Stage 3)")
+    parser.add_argument("--seed",          type=int,   default=42)
+    parser.add_argument("--out",           type=str,   default="data/dataset.pt")
     args = parser.parse_args()
 
     print(f"Generating {args.n_samples} samples  ({args.H}×{args.W}, {args.n_steps} steps, "
-          f"max_obstacles={args.max_obstacles}) ...")
+          f"max_obstacles={args.max_obstacles}, max_alpha={args.max_alpha}) ...")
     generate_dataset(
         n_samples=args.n_samples,
         H=args.H, W=args.W,
         n_steps=args.n_steps,
         max_obstacles=args.max_obstacles,
+        max_alpha=args.max_alpha,
         seed=args.seed,
         out_path=args.out,
     )

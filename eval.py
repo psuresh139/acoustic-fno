@@ -28,7 +28,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
-from generate_data import make_geometry, make_source_map, fdtd_2d
+from generate_data import make_geometry, make_source_map, make_alpha_map, fdtd_2d
 from model import FNO2D
 
 
@@ -211,20 +211,76 @@ def eval_geometry_swap(
         )
 
 
+def eval_alpha_sweep(
+    model,
+    device: str,
+    H: int          = 128,
+    n_steps: int    = 400,
+    max_alpha: float = 4.0,
+    n_obs: int      = 1,
+    seed: int       = 42,
+) -> None:
+    """
+    Fix geometry and source, sweep α from 0 (fully reflective) to max_alpha
+    (strongly absorptive).  Shows the FNO predicting the continuous transition
+    from a live reverberant room to a dead anechoic room — the Stage 3 headline result.
+    """
+    print(f"\n── Alpha sweep (α = 0 → {max_alpha}, {n_obs} obstacle(s)) ──")
+    rng  = np.random.default_rng(seed)
+    mask = make_geometry(H, H, n_obstacles=n_obs, rng=rng)
+    source, _ = make_source_map(H, H, mask, rng=rng)
+
+    alphas = np.linspace(0, max_alpha, 6)
+    n      = len(alphas)
+    fig, axes = plt.subplots(2, n, figsize=(3.5 * n, 7))
+
+    for col, alpha in enumerate(alphas):
+        gt        = fdtd_2d(mask, source, n_steps=n_steps, alpha=alpha)
+        alpha_map = make_alpha_map(H, H, alpha, max_alpha=max_alpha)
+
+        x = torch.tensor(
+            np.stack([mask, source, alpha_map])[None], dtype=torch.float32
+        ).to(device)
+        with torch.no_grad():
+            pred = model(x, mask=x[:, 0:1])[0, 0].cpu().numpy()
+
+        err  = relative_l2(pred, gt)
+        vmax = pressure_clim(gt)
+
+        for row, (field, label) in enumerate([
+            (gt,   f"FDTD  α={alpha:.1f}"),
+            (pred, f"FNO   err={err:.2f}"),
+        ]):
+            ax = axes[row, col]
+            ax.imshow(field, cmap="RdBu_r", vmin=-vmax, vmax=vmax,
+                      origin="lower", interpolation="bilinear")
+            ax.contour(mask, levels=[0.5], colors="k", linewidths=0.6)
+            ax.set_title(label, fontsize=9)
+            ax.axis("off")
+
+    fig.suptitle("Alpha sweep: reflective → absorptive", fontsize=13)
+    plt.tight_layout()
+    out = "figures/alpha_sweep.png"
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {out}")
+
+
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt",     type=str, required=True)
-    parser.add_argument("--data",     type=str, required=True,
-                        help="Path to the training data (.pt) used for in-dist eval")
-    parser.add_argument("--device",   type=str,
+    parser.add_argument("--ckpt",          type=str,   required=True)
+    parser.add_argument("--data",          type=str,   required=True)
+    parser.add_argument("--device",        type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--n_steps",      type=int, default=200)
-    parser.add_argument("--H_train",      type=int, default=64)
-    parser.add_argument("--H_super",      type=int, default=128)
-    parser.add_argument("--max_obstacles", type=int, default=0,
-                        help="Match to the value used when generating training data")
+    parser.add_argument("--n_steps",       type=int,   default=400)
+    parser.add_argument("--H_train",       type=int,   default=128)
+    parser.add_argument("--H_super",       type=int,   default=256)
+    parser.add_argument("--max_obstacles", type=int,   default=0)
+    parser.add_argument("--max_alpha",     type=float, default=0.0,
+                        help="Max alpha used in training. >0 enables alpha sweep demo.")
     args = parser.parse_args()
 
     model = load_model(args.ckpt, args.device)
@@ -236,6 +292,10 @@ if __name__ == "__main__":
                          n_steps=args.n_steps, max_obstacles=args.max_obstacles)
     eval_geometry_swap(model, args.device, H=args.H_train,
                        n_steps=args.n_steps, max_obstacles=args.max_obstacles)
-    eval_geometry_swap(model, args.device, H=args.H_train, n_steps=args.n_steps)
+
+    if args.max_alpha > 0:
+        eval_alpha_sweep(model, args.device, H=args.H_train,
+                         n_steps=args.n_steps, max_alpha=args.max_alpha,
+                         n_obs=min(1, args.max_obstacles))
 
     print("\nAll figures saved to figures/")
